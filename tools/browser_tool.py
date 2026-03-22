@@ -3,20 +3,26 @@
 Browser Tool Module
 
 This module provides browser automation tools using agent-browser CLI.  It
-supports two backends — **Browserbase** (cloud) and **local Chromium** — with
-identical agent-facing behaviour.  The backend is auto-detected: if
-``BROWSERBASE_API_KEY`` is set the cloud service is used; otherwise a local
-headless Chromium instance is launched automatically.
+supports three backends — **Browserbase** (cloud), **Lightpanda** (local, preferred),
+and **Chromium** (local, fallback) — with identical agent-facing behaviour.  The
+backend is auto-detected:
+
+1. If ``BROWSERBASE_API_KEY`` is set → cloud service is used.
+2. If ``lightpanda`` binary is found in PATH → local Lightpanda (default).
+3. Otherwise → local headless Chromium via agent-browser.
+
+The user can override the local engine with ``AGENT_BROWSER_ENGINE`` env var
+or ``browser.local_engine`` in ``config.yaml``.
 
 The tool uses agent-browser's accessibility tree (ariaSnapshot) for text-based
 page representation, making it ideal for LLM agents without vision capabilities.
 
 Features:
-- **Local mode** (default): zero-cost headless Chromium via agent-browser.
-  Works on Linux servers without a display.  One-time setup:
-  ``agent-browser install`` (downloads Chromium) or
-  ``agent-browser install --with-deps`` (also installs system libraries for
-  Debian/Ubuntu/Docker).
+- **Local mode** (default): zero-cost headless browser via agent-browser.
+  Uses Lightpanda when available (auto-detected), falls back to Chromium.
+  One-time setup for Chromium: ``agent-browser install`` or
+  ``agent-browser install --with-deps`` (Debian/Ubuntu/Docker).
+  Lightpanda: install binary to PATH (no Chromium needed).
 - **Cloud mode**: Browserbase cloud execution with stealth features, proxies,
   and CAPTCHA solving.  Activated when BROWSERBASE_API_KEY is set.
 - Session isolation per task ID
@@ -35,6 +41,7 @@ Environment Variables:
   requires paid plan (default: "true")
 - BROWSERBASE_SESSION_TIMEOUT: Custom session timeout in milliseconds. Set to extend
   beyond project default. Common values: 600000 (10min), 1800000 (30min) (default: none)
+- AGENT_BROWSER_ENGINE: Local browser engine override: "lightpanda" or "chrome" (default: auto-detect)
 
 Usage:
     from tools.browser_tool import browser_navigate, browser_snapshot, browser_click
@@ -532,7 +539,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_close",
-        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up Browserbase session quota.",
+        "description": "Close the browser session and release resources. Call this when done with browser tasks to free up resources.",
         "parameters": {
             "type": "object",
             "properties": {},
@@ -589,16 +596,53 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
+def _get_local_engine() -> str:
+    """Return the local browser engine name (``chrome`` or ``lightpanda``).
+
+    Resolution order:
+    1. ``AGENT_BROWSER_ENGINE`` env var (set by ``/browser engine`` or config)
+    2. ``config.yaml → browser.local_engine``
+    3. Auto-detect: if ``lightpanda`` binary is in PATH, use ``lightpanda``
+    4. Fall back to ``chrome``
+    """
+    # 1. Env var (highest priority — runtime override)
+    env_engine = os.environ.get("AGENT_BROWSER_ENGINE", "").strip().lower()
+    if env_engine in ("chrome", "lightpanda"):
+        return env_engine
+
+    # 2. Config file
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            cfg_engine = cfg.get("browser", {}).get("local_engine", "").strip().lower()
+            if cfg_engine in ("chrome", "lightpanda"):
+                return cfg_engine
+    except Exception:
+        pass
+
+    # 3. Auto-detect lightpanda
+    if shutil.which("lightpanda"):
+        return "lightpanda"
+
+    # 4. Default
+    return "chrome"
+
+
 def _create_local_session(task_id: str) -> Dict[str, str]:
     import uuid
+    engine = _get_local_engine()
     session_name = f"h_{uuid.uuid4().hex[:10]}"
-    logger.info("Created local browser session %s for task %s",
-                session_name, task_id)
+    logger.info("Created local browser session %s for task %s (engine=%s)",
+                session_name, task_id, engine)
     return {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": None,
-        "features": {"local": True},
+        "features": {"local": True, "engine": engine},
     }
 
 
@@ -790,7 +834,7 @@ def _run_browser_command(
     
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.
-    # Local mode: --session <name> launches a local headless Chromium.
+    # Local mode: --session <name> launches a local headless Chromium (or Lightpanda).
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
         # Cloud mode — connect to remote Browserbase browser via CDP
@@ -798,8 +842,26 @@ def _run_browser_command(
         # --session creates a local browser instance and silently ignores --cdp.
         backend_args = ["--cdp", session_info["cdp_url"]]
     else:
-        # Local mode — launch a headless Chromium instance
+        # Local mode — launch a local headless browser instance
         backend_args = ["--session", session_info["session_name"]]
+        # Inject --engine when using a non-default engine (e.g. lightpanda)
+        engine = session_info.get("features", {}).get("engine", "chrome")
+        if engine != "chrome":
+            backend_args = [f"--engine", engine] + backend_args
+        # Inject --profile for persistent login sessions (chrome only)
+        if engine == "chrome":
+            try:
+                hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+                config_path = hermes_home / "config.yaml"
+                if config_path.exists():
+                    import yaml
+                    with open(config_path) as f:
+                        cfg = yaml.safe_load(f) or {}
+                    profile_path = cfg.get("browser", {}).get("profile")
+                    if profile_path:
+                        backend_args = [f"--profile", profile_path] + backend_args
+            except Exception:
+                pass  # Ignore config errors, profile is optional
 
     cmd_parts = browser_cmd.split() + backend_args + [
         "--json",
@@ -1046,6 +1108,28 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
         })
 
+    # Warn against using browser for simple information lookups
+    # This is a heuristic — not perfect, but catches common misuse patterns
+    info_only_patterns = [
+        r"docs\.", r"documentation", r"/docs/", r"/guide/", r"/tutorial/",
+        r"readthedocs\.io", r"github\.com/[^/]+/[^/]+/(blob|tree|wiki)",
+        r"stackoverflow\.com", r"medium\.com", r"dev\.to",
+        r"wikipedia\.org", r"mdn\.mozilla\.org", r"developer\.mozilla\.org",
+        r"api\..*\.com", r".*\.ai/docs", r".*\.io/docs"
+    ]
+    if any(re.search(pattern, url, re.IGNORECASE) for pattern in info_only_patterns):
+        # Check if this looks like a read-only request (no complex query params)
+        query_parts = [p for p in url.split("?")[1].split("&") if "=" in p] if "?" in url else []
+        has_complex_params = any(p.split("=")[1] for p in query_parts if len(p.split("=")) > 1)
+        if not has_complex_params:
+            logger.warning(
+                "browser_navigate called on likely information-only URL: %s. "
+                "Consider using web_search or web_extract instead — they are far more efficient. "
+                "Browser tools should be reserved for pages requiring JS rendering, "
+                "interactive tasks, or visual verification.",
+                url
+            )
+
     effective_task_id = task_id or "default"
     
     # Get session info to check if this is a new session
@@ -1103,7 +1187,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Include feature info on first navigation so model knows what's active
         if is_first_nav and "features" in session_info:
             features = session_info["features"]
-            active_features = [k for k, v in features.items() if v]
+            active_features = [k for k, v in features.items() if v is True]
+            engine = features.get("engine")
+            if engine and engine != "chrome":
+                active_features.append(f"engine:{engine}")
             if not features.get("proxies"):
                 response["stealth_warning"] = (
                     "Running WITHOUT residential proxies. Bot detection may be more aggressive. "
@@ -1795,8 +1882,9 @@ def check_browser_requirements() -> bool:
     """
     Check if browser tool requirements are met.
 
-    In **local mode** (no Browserbase credentials): only the ``agent-browser``
-    CLI must be findable.
+    In **local mode** (no Browserbase credentials): the ``agent-browser``
+    CLI must be findable.  Lightpanda is auto-detected; if not present,
+    Chromium is used instead (may need ``agent-browser install`` first).
 
     In **cloud mode** (BROWSERBASE_API_KEY set): the CLI *and* both
     ``BROWSERBASE_API_KEY`` / ``BROWSERBASE_PROJECT_ID`` must be present.
@@ -1830,7 +1918,11 @@ if __name__ == "__main__":
     print("=" * 40)
 
     _cp = _get_cloud_provider()
-    mode = "local" if _cp is None else f"cloud ({_cp.provider_name()})"
+    if _cp is None:
+        engine = _get_local_engine()
+        mode = f"local ({engine})"
+    else:
+        mode = f"cloud ({_cp.provider_name()})"
     print(f"   Mode: {mode}")
     
     # Check requirements

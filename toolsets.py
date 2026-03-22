@@ -41,11 +41,9 @@ _HERMES_CORE_TOOLS = [
     "mixture_of_agents",
     # Skills
     "skills_list", "skill_view", "skill_manage",
-    # Browser automation
-    "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_close", "browser_get_images",
-    "browser_vision", "browser_console",
+    # NOTE: Browser tools intentionally NOT in core — they are opt-in via
+    # the "browser" toolset (use web_search/web_extract for lookups instead).
+    # Add "browser" to platform_toolsets in config.yaml to enable.
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -238,10 +236,7 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
-            "browser_navigate", "browser_snapshot", "browser_click",
-            "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
-            "browser_vision", "browser_console",
+            # NOTE: Browser tools intentionally NOT included — opt-in via "browser" toolset
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
