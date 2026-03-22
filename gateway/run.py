@@ -3010,13 +3010,30 @@ class GatewayRunner:
         session_key = session_entry.session_key
         is_running = session_key in self._running_agents
         
+        # Resolve model and context limit for token percentage
+        from agent.model_metadata import get_model_context_length
+        model = _resolve_gateway_model()
+        context_limit = get_model_context_length(model)
+        tokens = session_entry.total_tokens
+        percent = (tokens / context_limit * 100) if context_limit > 0 else 0
+        
+        # Calculate auto-compaction progress bar
+        COMPACTION_THRESHOLD_PCT = 0.50
+        compaction_threshold = int(context_limit * COMPACTION_THRESHOLD_PCT)
+        compaction_pct = min(100.0, (tokens / compaction_threshold) * 100) if compaction_threshold > 0 else 0
+        bar_length = 20
+        filled = int(bar_length * compaction_pct / 100)
+        compaction_bar = "▰" * filled + "▱" * (bar_length - filled)
+        
         lines = [
             "📊 **Hermes Gateway Status**",
             "",
             f"**Session ID:** `{session_entry.session_id[:12]}...`",
             f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**Tokens:** {session_entry.total_tokens:,}",
+            f"**Tokens:** {tokens:,} / {context_limit:,} ({percent:.0f}%)",
+            f"**Auto-Compaction:** {compaction_bar} {compaction_pct:.0f}%",
+            f"**Model:** {model}",
             f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
