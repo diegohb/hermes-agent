@@ -189,21 +189,6 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex")
 
-WEB_LOOKUP_RULE = (
-    "CRITICAL RULE — DO NOT VIOLATE: When you need information from the web, "
-    "ALWAYS use web_search or web_extract tools first. These return clean "
-    "structured text and are orders of magnitude more efficient.\n\n"
-    "YOU MUST NOT use browser_navigate, browser_snapshot, or browser_click for: "
-    "information lookups, reading documentation, researching topics, or ANY task where "
-    "you only need to READ page content. This wastes resources and is the wrong tool.\n\n"
-    "Browser tools are EXCLUSIVELY reserved for: (1) pages that require JavaScript "
-    "rendering that cannot be fetched by web tools, (2) interactive tasks requiring "
-    "forms, logins, or multi-step flows, (3) visual verification when you need to SEE "
-    "something, (4) CAPTCHAs or anti-bot challenges.\n\n"
-    "If you find yourself calling browser_navigate just to read a page, STOP. "
-    "Use web_search or web_extract instead. This is a hard rule — violations "
-    "are incorrect behavior."
-)
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
