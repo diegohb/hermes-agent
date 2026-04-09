@@ -19,7 +19,7 @@ data/
 .pytest_cache/
 tmp/
 temp_vision_images/
-hermes-*/*
+hermes-*/*/
 examples/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl
@@ -61,4 +61,11 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+
 website/static/api/skills-index.json
+
+# Diego's local customizations - not for upstream
+.agents/
+config/
+skills-lock.json
+"*.AppData/Local/Google/Chrome/User Data/"
