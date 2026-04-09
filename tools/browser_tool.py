@@ -5,18 +5,18 @@ Browser Tool Module
 This module provides browser automation tools using agent-browser CLI.  It
 supports multiple backends — **Browser Use** (cloud, default for Nous
 subscribers), **Browserbase** (cloud, direct credentials), and **local
-Chromium** — with identical agent-facing behaviour.  The backend is
+Chromium or Lightpanda** — with identical agent-facing behaviour.  The backend is
 auto-detected from config and available credentials.
 
 The tool uses agent-browser's accessibility tree (ariaSnapshot) for text-based
 page representation, making it ideal for LLM agents without vision capabilities.
 
 Features:
-- **Local mode** (default): zero-cost headless Chromium via agent-browser.
-  Works on Linux servers without a display.  One-time setup:
-  ``agent-browser install`` (downloads Chromium) or
-  ``agent-browser install --with-deps`` (also installs system libraries for
-  Debian/Ubuntu/Docker).
+- **Local mode** (default): zero-cost headless browser via agent-browser.
+  Uses Lightpanda when available (auto-detected), falls back to Chromium.
+  One-time setup for Chromium: ``agent-browser install`` or
+  ``agent-browser install --with-deps`` (Debian/Ubuntu/Docker).
+  Lightpanda: install binary to PATH (no Chromium needed).
 - **Cloud mode**: Browserbase or Browser Use cloud execution when configured.
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
@@ -25,6 +25,8 @@ Features:
 - Automatic cleanup of browser sessions
 
 Environment Variables:
+- AGENT_BROWSER_ENGINE: Local browser engine override: "chrome" or "lightpanda"
+  (default: auto-detect lightpanda, fall back to chrome)
 - BROWSERBASE_API_KEY: API key for direct Browserbase cloud mode
 - BROWSERBASE_PROJECT_ID: Project ID for direct Browserbase cloud mode
 - BROWSER_USE_API_KEY: API key for direct Browser Use cloud mode
@@ -660,16 +662,53 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
+def _get_local_engine() -> str:
+    """Return the local browser engine name (``chrome`` or ``lightpanda``).
+
+    Resolution order:
+    1. ``AGENT_BROWSER_ENGINE`` env var (set by ``/browser engine`` or config)
+    2. ``config.yaml → browser.local_engine``
+    3. Auto-detect: if ``lightpanda`` binary is in PATH, use ``lightpanda``
+    4. Fall back to ``chrome``
+    """
+    # 1. Env var (highest priority — runtime override)
+    env_engine = os.environ.get("AGENT_BROWSER_ENGINE", "").strip().lower()
+    if env_engine in ("chrome", "lightpanda"):
+        return env_engine
+
+    # 2. Config file
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            cfg_engine = cfg.get("browser", {}).get("local_engine", "").strip().lower()
+            if cfg_engine in ("chrome", "lightpanda"):
+                return cfg_engine
+    except Exception:
+        pass
+
+    # 3. Auto-detect lightpanda
+    if shutil.which("lightpanda"):
+        return "lightpanda"
+
+    # 4. Default
+    return "chrome"
+
+
 def _create_local_session(task_id: str) -> Dict[str, str]:
     import uuid
+    engine = _get_local_engine()
     session_name = f"h_{uuid.uuid4().hex[:10]}"
-    logger.info("Created local browser session %s for task %s",
-                session_name, task_id)
+    logger.info("Created local browser session %s for task %s (engine=%s)",
+                session_name, task_id, engine)
     return {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": None,
-        "features": {"local": True},
+        "features": {"local": True, "engine": engine},
     }
 
 
@@ -866,7 +905,7 @@ def _run_browser_command(
     
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.
-    # Local mode: --session <name> launches a local headless Chromium.
+    # Local mode: --session <name> launches a local headless Chromium (or Lightpanda).
     # The rest of the command (--json, command, args) is identical.
     if session_info.get("cdp_url"):
         # Cloud mode — connect to remote Browserbase browser via CDP
@@ -874,8 +913,12 @@ def _run_browser_command(
         # --session creates a local browser instance and silently ignores --cdp.
         backend_args = ["--cdp", session_info["cdp_url"]]
     else:
-        # Local mode — launch a headless Chromium instance
+        # Local mode — launch a local headless browser instance
         backend_args = ["--session", session_info["session_name"]]
+        # Inject --engine when using a non-default engine (e.g. lightpanda)
+        engine = session_info.get("features", {}).get("engine", "chrome")
+        if engine != "chrome":
+            backend_args = ["--engine", engine] + backend_args
 
     # Keep concrete executable paths intact, even when they contain spaces.
     # Only the synthetic npx fallback needs to expand into multiple argv items.
