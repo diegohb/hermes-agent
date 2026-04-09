@@ -21,21 +21,29 @@ custom/main: Long-lived divergent branch with Diego's customizations
 
 ## Current Customizations
 
-As of 2026-04-09, custom/main contains these changes relative to upstream/main:
+As of 2026-04-09 (FULL REBASE), custom/main is 1:1 with upstream/main except for:
 
 ### 1. .gitignore additions
-- `.agents/` - Diego's local agent files
-- `config/` - Local configuration directory
-- `skills-lock.json` - Skills lock file
+- `.agents/` - Diego's local agent files (backed up and restored)
+- `config/` - Local configuration directory (not in repo)
+- `skills-lock.json` - Skills lock file (not in repo)
 - `"*.AppData/Local/Google/Chrome/User Data/"` - Chrome user data
 
-### 2. STT Model Selection Fix (`tools/transcription_tools.py`)
-Prevents cloud STT model names (e.g., `whisper-1`) from being passed to local providers (faster-whisper) which expect size names (tiny, base, small, etc.).
+### 2. FORK-MAPPING.md
+This documentation file (not in upstream).
 
-The fix detects if the STT provider is `local` or `local_command` and returns `None` so that `transcribe_audio()` uses the correct local model configuration instead of the top-level `stt.model` override.
+### Removed Customizations (performed full rebase):
+- STT Model Selection Fix (tools/transcription_tools.py) - LOST, may need to re-apply
+- mcporter Typo Fix - LOST, may need to re-apply
+- All gateway/run.py customizations - LOST, now aligned with upstream
+- All tools/browser_tool.py customizations - LOST, now aligned with upstream
+- All agent/prompt_builder.py customizations - LOST, now aligned with upstream
+- package.json changes - LOST, now aligned with upstream
 
-### 3. mcporter Typo Fix (`skills/mcp/mcporter/SKILL.md`)
-Fixes "ad-hoc" → "ad hoc" in documentation.
+### Preserved (external to repo):
+- Hindsight memory integration (~/.hermes/hindsight/, ~/.hermes/config.yaml) - FULLY PRESERVED
+- .agents/ directory with local skill customizations - PRESERVED
+- All local configuration in ~/.hermes/ - PRESERVED
 
 ## Fork-Only Files
 
