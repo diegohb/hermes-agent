@@ -58,3 +58,9 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+
+# Diego's local customizations - not for upstream
+.agents/
+config/
+skills-lock.json
+"*.AppData/Local/Google/Chrome/User Data/"
