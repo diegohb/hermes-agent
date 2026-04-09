@@ -96,12 +96,31 @@ _local_model_name: Optional[str] = None
 def get_stt_model_from_config() -> Optional[str]:
     """Read the STT model name from ~/.hermes/config.yaml.
 
-    Returns the value of ``stt.model`` if present, otherwise ``None``.
+    Returns a provider-appropriate model override, or ``None`` to let
+    ``transcribe_audio()`` pick the per-provider default.
+
+    - For cloud providers (openai, groq): returns ``stt.model`` if set.
+    - For local providers (local, local_command): returns ``None`` so that
+      ``transcribe_audio()`` falls back to ``stt.local.model`` or the
+      built-in default (``base``).  This prevents cloud model names like
+      ``whisper-1`` from being passed to faster-whisper, which expects
+      sizes like ``tiny``, ``base``, ``small``, etc.
+
     Silently returns ``None`` on any error (missing file, bad YAML, etc.).
     """
     try:
-        from hermes_cli.config import read_raw_config
-        return read_raw_config().get("stt", {}).get("model")
+        import yaml
+        cfg_path = get_hermes_home() / "config.yaml"
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                data = yaml.safe_load(f) or {}
+            stt = data.get("stt", {})
+            provider = stt.get("provider", "")
+            # Local providers: return None so transcribe_audio uses local config
+            if provider in ("local", "local_command"):
+                return None
+            # Cloud providers: return the top-level model override
+            return stt.get("model")
     except Exception:
         pass
     return None
