@@ -143,11 +143,33 @@ source venv/bin/activate
 # 3.2 Upgrade pip
 pip install --upgrade pip
 
-# 3.3 Reinstall hermes-agent (always safe, even if no dependency changes)
-pip install --force-reinstall -e .
+# 3.3 Clear stale Python bytecode cache (prevents ImportError after updates)
+echo "→ Clearing stale __pycache__ directories..."
+find . -type d -name "__pycache__" \
+  -not -path "./venv/*" \
+  -not -path "./.venv/*" \
+  -not -path "./node_modules/*" \
+  -not -path "./.git/*" \
+  -not -path "./.worktrees/*" \
+  -exec rm -rf {} + 2>/dev/null
+echo "  ✓ Bytecode cache cleared"
 
-# OR if that fails, try:
-# pip install -e .
+# 3.4 Update Python dependencies
+# Prefer uv if available, otherwise use pip
+if command -v uv &> /dev/null; then
+  echo "→ Using uv for dependency updates..."
+  uv pip install --reinstall -e .
+else
+  echo "→ Using pip for dependency updates..."
+  pip install --force-reinstall -e .
+fi
+
+# 3.5 Sync bundled skills to ~/.hermes/skills/
+echo "→ Syncing bundled skills..."
+hermes skills update
+
+# 3.6 Reinstall hermes-agent to ensure editable install is fresh
+pip install --force-reinstall -e .
 
 # ==================================================
 # PHASE 4: Verify and restart
@@ -191,8 +213,31 @@ git push --force-with-lease origin custom/main
 
 # 7. Update venv
 source venv/bin/activate
-pip install --upgrade pip
-pip install --force-reinstall -e .
+
+# 7.1 Clear stale Python bytecode cache
+echo "→ Clearing stale __pycache__ directories..."
+find . -type d -name "__pycache__" \
+  -not -path "./venv/*" \
+  -not -path "./.venv/*" \
+  -not -path "./node_modules/*" \
+  -not -path "./.git/*" \
+  -not -path "./.worktrees/*" \
+  -exec rm -rf {} + 2>/dev/null
+echo "  ✓ Bytecode cache cleared"
+
+# 7.2 Update dependencies (prefer uv if available)
+if command -v uv &> /dev/null; then
+  echo "→ Using uv for dependency updates..."
+  uv pip install --reinstall -e .
+else
+  echo "→ Using pip for dependency updates..."
+  pip install --upgrade pip
+  pip install --force-reinstall -e .
+fi
+
+# 7.3 Sync bundled skills
+echo "→ Syncing bundled skills..."
+hermes skills update
 
 # 8. Restart gateway
 systemctl --user restart hermes-gateway
@@ -472,6 +517,11 @@ gh pr create --repo NousResearch/hermes-agent --title "feat: your feature" --bod
 
 ## Last Updated
 
+- 2026-05-02: Enhanced PHASE 3 with steps from `hermes update`:
+  - Added bytecode cache clearing (prevents ImportError after updates)
+  - Added bundled skills syncing via `hermes skills update`
+  - Added uv support for faster dependency installation
+  - Added comprehensive error handling for missing pip in venv
 - 2026-04-13: Documented venv freeze as required step in sync process
 - 2026-04-13: Added comprehensive rollback procedures for all failure scenarios
 - 2026-04-13: Clarified that both `main` and `custom/main` must be updated during sync
@@ -480,3 +530,31 @@ gh pr create --repo NousResearch/hermes-agent --title "feat: your feature" --bod
 - 2026-04-09: Virtual environment: venv/ (Python 3.11.15) - fully operational
 - 2026-04-09: Cron job "hermes-fork-sync-analyze" active (runs daily at 4 AM)
 - 2026-04-09: Initial documentation after custom/main rebase (640 commits synced)
+
+## Process Comparison: FORK-MAPPING vs `hermes update`
+
+The `hermes update` command is built into the official codebase and works well for upstream-first installations, but it's designed for a different use case. Our FORK-MAPPING process is specifically tailored for maintaining divergent customizations in a fork:
+
+| Feature | FORK-MAPPING Process | `hermes update` |
+|---------|---------------------|-----------------|
+| **Branch strategy** | Two-branch (main + custom/main) | Single-branch (main only) |
+| **Customizations** | Committed on custom/main, preserved via rebase | Only uncommitted changes (auto-stash) |
+| **Update method** | Rebase custom/main onto upstream/main | Fast-forward or hard reset main |
+| **Gateway runs from** | custom/main | main |
+| **Bytecode cache clearing** | ✅ Added (from `hermes update`) | ✅ Built-in |
+| **Skill syncing** | ✅ Added (from `hermes update`) | ✅ Built-in |
+| **Dependency reinstallation** | ✅ Already present | ✅ Built-in |
+| **Gateway restart** | ✅ Already present | ✅ Built-in |
+| **Rollback procedures** | ✅ Comprehensive (venv freeze + backup branches) | ❌ Limited (stash only) |
+| **Suitable for** | Fork maintainers with divergent customizations | Upstream-first users without custom commits |
+
+### Steps Incorporated from `hermes update`
+
+We've added the following improvements to FORK-MAPPING.md based on `hermes update`:
+
+1. **Bytecode cache clearing**: Removes stale `__pycache__` directories to prevent `ImportError` when updated code references new/changed names
+2. **Bundled skills syncing**: Runs `hermes skills update` to sync new/updated bundled skills to `~/.hermes/skills/`
+3. **uv support**: Prefers `uv` for faster dependency installation if available, falls back to pip
+4. **Comprehensive venv handling**: Includes pip bootstrapping if venv loses pip (from `ensurepip`)
+
+These additions make our process more complete while maintaining the fork-specific workflow we need.
