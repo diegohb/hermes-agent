@@ -1,89 +1,114 @@
 #!/bin/bash
-
-# Hermes fork sync and analysis script
-# This script:
-# 1. Syncs main branch with upstream/main
-# 2. Analyzes how many commits custom/main is behind upstream
-# 3. Exits with code 0 if everything is up to date
-# 4. Exits with code 1 if custom/main needs rebase
+# Hermes Agent Fork Sync and Analysis Script
+# Syncs main with upstream, analyzes custom/main delta, requests approval for rebase
+#
+# IMPORTANT: This script uses git worktrees to avoid modifying the working directory
+# of the main checkout. This prevents triggering the gateway's stale-code detection
+# which auto-restarts when files on disk are newer than the running process.
+# See FORK-MAPPING.md "Pitfalls" section for details.
 
 set -e
 
 REPO_DIR="/home/diegohb/.hermes/hermes-agent"
+WORKTREE_DIR="/tmp/hermes-fork-sync-main"
 cd "$REPO_DIR"
 
-echo "=== Hermes Fork Sync and Analysis ==="
-echo "Repository: $REPO_DIR"
-echo "Date: $(date)"
-echo ""
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Step 1: Fetch all remotes
-echo "Step 1: Fetching all remotes..."
-git fetch --all --prune
+echo -e "${BLUE}=== Hermes Fork Sync and Analysis ===${NC}"
+echo
 
-# Step 2: Check current branch and save it
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-echo "Current branch: $CURRENT_BRANCH"
-echo ""
+# Cleanup function to remove worktree on exit
+cleanup() {
+    if [ -d "$WORKTREE_DIR" ]; then
+        git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
-# Step 3: Sync main branch with upstream/main
-echo "Step 2: Syncing main branch with upstream/main..."
-git checkout main
-git reset --hard origin/main
-git fetch upstream
-git merge upstream/main --no-edit
-git push origin main
-echo "Main branch synced successfully."
-echo ""
+# Step 1: Sync main with upstream/main using a worktree
+echo -e "${YELLOW}[1/4] Syncing main with upstream/main (via worktree)...${NC}"
 
-# Step 4: Analyze custom/main vs upstream/main
-echo "Step 3: Analyzing custom/main vs upstream/main..."
+# Create worktree for main branch
+git worktree add "$WORKTREE_DIR" main >/dev/null 2>&1
 
-# Check if custom branch exists
-if ! git show-ref --verify --quiet refs/heads/custom/main; then
-    echo "ERROR: custom/main branch does not exist!"
-    exit 1
-fi
+# Fetch upstream
+git -C "$WORKTREE_DIR" fetch upstream >/dev/null 2>&1
 
-# Get commit counts
-UPSTREAM_COMMIT=$(git rev-parse upstream/main)
-CUSTOM_COMMIT=$(git rev-parse custom/main)
-
-# Count commits custom/main is behind upstream/main
-BEHIND_COUNT=$(git rev-list --count "$UPSTREAM_COMMIT"..."$CUSTOM_COMMIT" 2>/dev/null || echo "0")
-
-# Count commits custom/main is ahead of upstream/main
-AHEAD_COUNT=$(git rev-list --count "$CUSTOM_COMMIT"..."$UPSTREAM_COMMIT" 2>/dev/null || echo "0")
-
-echo ""
-echo "=== Analysis Results ==="
-echo "Upstream/main commit: $UPSTREAM_COMMIT"
-echo "Custom/main commit: $CUSTOM_COMMIT"
-echo "Custom/main is $AHEAD_COUNT commits ahead of upstream/main"
-echo "Custom/main is $BEHIND_COUNT commits behind upstream/main"
-echo ""
-
-# Step 5: Determine if rebase is needed
-if [ "$AHEAD_COUNT" -eq "0" ] && [ "$BEHIND_COUNT" -eq "0" ]; then
-    echo "✓ custom/main is up to date with upstream/main"
-    echo "No action needed."
-
-    # Restore original branch
-    git checkout "$CURRENT_BRANCH" 2>/dev/null || true
-    exit 0
+# Check if main can fast-forward
+if git -C "$WORKTREE_DIR" merge-base --is-ancestor HEAD upstream/main 2>/dev/null; then
+    git -C "$WORKTREE_DIR" merge --ff-only upstream/main
+    echo -e "${GREEN}✓ main fast-forwarded to upstream/main${NC}"
 else
-    echo "⚠ custom/main needs to be rebased onto upstream/main"
-    echo ""
-    echo "Summary:"
-    echo "  - $AHEAD_COUNT commits ahead (your custom work)"
-    echo "  - $BEHIND_COUNT commits behind (upstream changes)"
-    echo ""
-    echo "To rebase, run:"
-    echo "  git checkout custom/main"
-    echo "  git rebase upstream/main"
-    echo "  git push origin custom/main --force-with-lease"
-
-    # Restore original branch
-    git checkout "$CURRENT_BRANCH" 2>/dev/null || true
-    exit 1
+    echo -e "${YELLOW}⚠ main has diverged, using hard reset${NC}"
+    git -C "$WORKTREE_DIR" reset --hard upstream/main
+    echo -e "${GREEN}✓ main reset to upstream/main${NC}"
 fi
+
+# Push main to origin
+git -C "$WORKTREE_DIR" push origin main -f >/dev/null 2>&1
+echo -e "${GREEN}✓ main pushed to origin${NC}"
+echo
+
+# Step 2: Analyze custom/main vs upstream/main
+echo -e "${YELLOW}[2/4] Analyzing custom/main vs upstream/main...${NC}"
+
+# Count commits behind
+COMMITS_BEHIND=$(git rev-list --count origin/custom/main..upstream/main 2>/dev/null || echo "0")
+COMMITS_AHEAD=$(git rev-list --count upstream/main..origin/custom/main 2>/dev/null || echo "0")
+
+echo -e "  Commits behind upstream: ${RED}${COMMITS_BEHIND}${NC}"
+echo -e "  Commits ahead of upstream: ${GREEN}${COMMITS_AHEAD}${NC}"
+echo
+
+# Step 3: Check if rebase is needed
+if [ "$COMMITS_BEHIND" -eq 0 ]; then
+    echo -e "${GREEN}✓ custom/main is up to date with upstream/main${NC}"
+    echo
+    echo -e "${BLUE}=== Summary ===${NC}"
+    echo "main: ✓ synced with upstream"
+    echo "custom/main: ✓ already up to date"
+    echo
+    echo "No action needed."
+    exit 0
+fi
+
+# Step 4: Show preview of upstream changes
+echo -e "${YELLOW}[3/4] Preview of upstream changes:${NC}"
+git log --oneline origin/custom/main..upstream/main | head -20
+if [ "$COMMITS_BEHIND" -gt 20 ]; then
+    echo -e "... and $((COMMITS_BEHIND - 20)) more commits"
+fi
+echo
+
+# Step 5: Show custom commits not in upstream
+if [ "$COMMITS_AHEAD" -gt 0 ]; then
+    echo -e "${YELLOW}[4/4] Custom commits that will be rebased:${NC}"
+    git log --oneline upstream/main..origin/custom/main
+    echo
+fi
+
+# Decision point
+echo -e "${BLUE}=== Action Required ===${NC}"
+echo -e "${YELLOW}custom/main is ${COMMITS_BEHIND} commits behind upstream/main.${NC}"
+echo
+echo "To rebase custom/main onto upstream/main, run:"
+echo -e "${GREEN}  cd $REPO_DIR${NC}"
+echo -e "${GREEN}  git checkout custom/main${NC}"
+echo -e "${GREEN}  git rebase upstream/main${NC}"
+echo -e "${GREEN}  # Resolve conflicts if any${NC}"
+echo -e "${GREEN}  git push --force-with-lease origin custom/main${NC}"
+echo
+echo "After rebase, update venv and restart gateway:"
+echo -e "${GREEN}  source venv/bin/activate${NC}"
+echo -e "${GREEN}  pip install -e .${NC}"
+echo -e "${GREEN}  systemctl --user restart hermes-gateway${NC}"
+echo
+
+# Exit with code 1 to signal action needed
+exit 1
