@@ -566,6 +566,67 @@ gh pr create --repo NousResearch/hermes-agent --title "feat: your feature" --bod
 
 **Never include fork-only customizations in upstream PRs.**
 
+## Pitfalls
+
+### Never Modify Working Directory While Gateway is Running
+
+The gateway has a **stale-code auto-restart feature** that detects when source files on disk are newer than the running process. It checks these sentinel files for modification times:
+
+- `hermes_cli/config.py`
+- `hermes_cli/__init__.py`
+- `run_agent.py`
+- `gateway/run.py`
+- `pyproject.toml`
+
+**Problem**: If any git operation (`git checkout`, `git merge`, `git rebase`, `git pull`) modifies the working directory while the gateway is running, the file mtimes change. On the next incoming message, the gateway detects the files are newer than its startup snapshot and triggers an auto-restart with the message:
+
+```
+⟳ Gateway code was updated in the background — restarting this gateway so your next message runs on the new code. Please retry in a moment.
+```
+
+This is **unauthorized and unexpected** - it conflicts with your controlled upgrade process via FORK-MAPPING.md.
+
+**Root Cause**: The `sync-fork.sh` cron job (runs daily at 4 AM) was doing:
+```bash
+git checkout main
+git merge --ff-only upstream/main
+```
+
+This modifies the working directory files, changing their mtimes and triggering gateway auto-restart.
+
+**Solution**: Always use **git worktrees** for background operations that must not affect the running gateway's working directory. The updated `sync-fork.sh` now uses:
+```bash
+git worktree add /tmp/hermes-fork-sync-main main
+git -C /tmp/hermes-fork-sync-main fetch upstream
+git -C /tmp/hermes-fork-sync-main merge --ff-only upstream/main
+git worktree remove /tmp/hermes-fork-sync-main --force
+```
+
+**Rule**: Any script, cron job, or automation that operates on the hermes-agent repo while the gateway is running MUST use worktrees. Never checkout branches or merge in the main working directory.
+
+### Worktree Best Practices
+
+1. **Always cleanup**: Use `trap` to ensure worktrees are removed even if the script exits early:
+   ```bash
+   cleanup() {
+       git worktree remove /tmp/hermes-worktree --force 2>/dev/null || true
+   }
+   trap cleanup EXIT
+   ```
+
+2. **Use a consistent path**: `/tmp/hermes-fork-sync-main` (or similar) ensures you can find/inspect it if debugging is needed.
+
+3. **Run all operations with `git -C`**: This ensures you never accidentally operate on the wrong directory:
+   ```bash
+   git -C "$WORKTREE_DIR" fetch upstream
+   git -C "$WORKTREE_DIR" merge --ff-only upstream/main
+   ```
+
+4. **Verify the worktree is on the correct branch**:
+   ```bash
+   git -C "$WORKTREE_DIR" branch --show-current  # Should print "main"
+   ```
+
 ## Last Updated
 
 - 2026-05-03: **v0.12.0 UPGRADE COMPLETE**:
