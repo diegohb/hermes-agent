@@ -52,12 +52,18 @@ skills/.hub/
 # TUI
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
+hermes_cli/web_dist/*
 
 # Docs
 docs/superpowers/*
 
 # Build artifacts
 result
+web/public/ds-assets/
+web/public/fonts/*.woff2
+
+# External projects
+mini-swe-agent/
 
 website/static/api/skills-index.json
 models-dev-upstream/
