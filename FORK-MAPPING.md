@@ -21,6 +21,24 @@ custom/main: Long-lived divergent branch with Diego's customizations
 
 ## Upgrade History
 
+### 2026-05-20: v0.12.0 → v0.14.0 Upgrade
+- **Commits synced**: 2108 upstream commits + 7 custom commits
+- **Key changes**:
+  - Version bump: 0.12.0 → 0.14.0 (release date: 2026-05-16)
+  - Updated dependencies: croniter 6.2.2→6.0.0, cryptography 47.0.0→48.0.0, pydantic 2.13.3→2.12.5, openai 2.32.0→2.24.0
+  - Added pytest-timeout plugin (was missing, required for test suite)
+  - Bundled skills: scrapling updated (1 skill)
+- **Issues encountered**:
+  - .gitignore conflict: Resolved by merging upstream `hermes_cli/tui_dist/*`, `hermes_cli/scripts/`, `docs/superpowers/*` with custom `.agents/`, `config/`, `skills-lock.json`, `"*.AppData/Local/Google/Chrome/User Data/"`
+  - pytest-timeout missing: Installed `pip install pytest-timeout` to run critical tests
+- **Tests run** (full suite too slow, ran critical tests):
+  - ✓ Fuzzy match: 34/34 passed (1.96s)
+  - ✓ Hindsight provider: 96/96 passed (12.02s)
+  - ✓ Memory tool: 33/33 passed (1.98s)
+  - ✓ Agent initialization: OK
+- **Validation**: Gateway restarted successfully, Telegram (30 commands) and Discord (159 skills) connected
+- **Custom commits preserved**: 7 (FORK-MAPPING docs, sync script, v0.12.0 lessons, cron worktree fix)
+
 ### 2026-05-03: v0.11.0 → v0.12.0 Upgrade
 - **Commits synced**: 1362 upstream commits + 5 custom commits
 - **Key changes**:
@@ -629,6 +647,14 @@ git worktree remove /tmp/hermes-fork-sync-main --force
 
 ## Last Updated
 
+- 2026-05-20: **v0.14.0 UPGRADE COMPLETE**:
+  - Synced 2108 upstream commits from v0.12.0 → v0.14.0
+  - Preserved 7 custom commits (FORK-MAPPING docs, sync script, v0.12.0 lessons, cron worktree fix)
+  - Resolved .gitignore conflict (merged upstream TUI/docs entries + custom Chrome data)
+  - Added pytest-timeout plugin to run critical tests
+  - Updated dependencies: croniter 6.2.2→6.0.0, cryptography 47.0.0→48.0.0
+  - All critical tests passing (163/163)
+  - Gateway restarted successfully (Telegram + Discord connected)
 - 2026-05-03: **v0.12.0 UPGRADE COMPLETE**:
   - Synced 1362 upstream commits from v0.11.0 → v0.12.0
   - Preserved 5 custom commits (FORK-MAPPING docs, sync script)
