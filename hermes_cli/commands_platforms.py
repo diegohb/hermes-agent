@@ -328,6 +328,34 @@ def discord_skill_commands_by_category(
     # reserved-command collision from two skills colliding on the clamp (the rename-worthy case).
     names_used: dict[str, str] = dict.fromkeys(reserved_names, "<reserved>")
     hidden = 0
+
+    def _admit(discord_name: str, description: str, cmd_key: str, origin: str) -> None:
+        """Clamp-check one candidate and file it (fork patch: shared by both scans below)."""
+        nonlocal hidden
+        prior = names_used.get(discord_name)
+        if prior == "<reserved>":
+            logger.warning(
+                "Discord /skill: %r (from %r) collides on its 32-char "
+                "clamp with a reserved gateway command name %r — the "
+                "skill will not appear in the /skill autocomplete. "
+                "Rename the skill's frontmatter ``name:`` to differ "
+                "in its first 32 chars.",
+                discord_name, cmd_key, discord_name)
+        elif prior is not None:
+            logger.warning(
+                "Discord /skill: %r and %r both clamp to %r on "
+                "Discord's 32-char command-name limit — only %r "
+                "will appear in the /skill autocomplete. Rename "
+                "one skill's frontmatter ``name:`` to differ in "
+                "its first 32 chars.",
+                prior, cmd_key, discord_name, prior)
+        if prior is not None:
+            hidden += 1
+            return
+        names_used[discord_name] = origin
+        entry = (discord_name, _truncate_desc(description, 100), cmd_key)
+        uncategorized.append(entry)
+
     try:
         for cmd_key, info, rel_parts in _iter_gateway_skills("discord"):
             # First (alphabetical) skill wins; the loser is dropped from the picker — warn loudly.
@@ -358,6 +386,16 @@ def discord_skill_commands_by_category(
                 categories.setdefault(rel_parts[0], []).append(entry)
             else:
                 uncategorized.append(entry)
+        # Fork patch (skill-collision dispatch): core-command-collision skills (``/handoff``,
+        # ``/plan``) live in the collision map under reserved ``/skill:<slug>`` dispatch keys.
+        # Offer them in the autocomplete under their frontmatter name; picking one dispatches
+        # ``/skill:<slug>`` which the gateway resolves via ``resolve_skill_command_key``'s
+        # collision fallback. The core command keeps its own native slash command.
+        from agent.skill_commands import get_collision_skill_commands
+        for cmd_key, info in sorted(get_collision_skill_commands().items()):
+            display = (info.get("name") or cmd_key.lstrip("/").split(":", 1)[-1])
+            _admit(display.lower().replace("_", "-").replace(" ", "-")[:32],
+                   info.get("description", ""), cmd_key, cmd_key)
     except Exception:
         pass
     return categories, uncategorized, hidden

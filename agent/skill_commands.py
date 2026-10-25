@@ -33,6 +33,15 @@ _last_interactive_skill_commands_by_key: dict[tuple, dict[str, dict[str, Any]]] 
 # local session for its whole lifetime, so a skill installed or removed from another terminal must
 # move this signature and rescan on the next lookup instead of waiting for /reload-skills (CFG-8).
 _skill_commands_sig_by_key: dict[tuple, tuple] = {}
+# Fork patch (skill-collision dispatch): skills whose auto-slug collides with a core command
+# (/handoff, /plan, ...) are published in this parallel map under the reserved key
+# ``/skill:<slug>`` instead of being dropped. Only collision-aware surfaces consume it:
+# ``resolve_skill_command_key`` / ``build_skill_invocation_message`` (gateway ``/skill:<slug>``
+# text dispatch) and the Discord ``/skill`` autocomplete collector. The MAIN map returned by
+# ``get_skill_commands()`` never contains these keys, so plain ``/<slug>`` dispatch keeps
+# resolving to the core builtin (the skill map is consulted before builtins) and every
+# non-collision-aware consumer (Telegram menu, webhook, matrix, palette) is unchanged.
+_collision_skill_commands_by_key: dict[tuple, dict[str, dict[str, Any]]] = {}
 _publish_lock = threading.Lock()
 # ``\w`` keeps Unicode letters (CJK, Cyrillic) so a ``name: 小说拆条`` skill registers ``/小说拆条``
 # instead of slugging to "" and being dropped (#12351); Telegram's ``[a-z0-9_]`` menu limit is
@@ -476,7 +485,8 @@ def skill_command_collision_note(name: str) -> Optional[str]:
     return f"slash command /{cmd_name} unavailable — name taken by built-in; use /skill {name}"
 
 
-def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dict[str, dict[str, Any]]) -> None:
+def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dict[str, dict[str, Any]],
+                   collisions: dict[str, dict[str, Any]] | None = None) -> None:
     """Register one SKILL.md in *commands* (no-op when filtered or colliding)."""
     from tools.skills_tool import _parse_frontmatter, skill_matches_apps, skill_matches_platform, skill_matches_environment
     if any(part in _SCAN_SKIP_PARTS for part in skill_md.parts):
@@ -496,11 +506,21 @@ def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dic
     cmd_name = slugify_skill_name(name)
     if not cmd_name:
         return
-    # A collision with a core command (name or alias) skips auto-registration; the skill stays
-    # loadable via /skill <name>. The same predicate feeds the /skills + palette notes.
+    # A collision with a core command (name or alias) must not claim ``/<slug>`` — the skill map
+    # is consulted before builtins, so that key would shadow the core command (370ebf2d2). Fork
+    # patch: instead of dropping the skill, park it in the collision map under the reserved
+    # ``/skill:<slug>`` key so the Discord ``/skill`` autocomplete can still offer it (dispatched
+    # through ``build_skill_invocation_message``). The log line keeps pointing CLI users at
+    # ``/skill <name>``; the collision note (``skill_command_collision_note``) is unchanged.
     if skill_command_collision_note(name) is not None:
         logger.warning("Skill %r generates slash command '/%s' which collides with a core Hermes command; "
                        "skipping auto-registration. Use '/skill %s' instead.", name, cmd_name, name)
+        if collisions is not None:
+            collisions[f"/skill:{cmd_name}"] = {
+                "name": name, "description": description or f"Invoke the {name} skill",
+                "skill_md_path": str(skill_md), "skill_dir": str(skill_md.parent),
+                "core_collision": True,
+            }
         return
     # Dedup on the slug too: "git_helper" and "git-helper" normalize the same.
     # First-wins preserves project > local > external precedence.
@@ -531,6 +551,8 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
     # Taken BEFORE the scan: an install racing the scan moves it, so the next lookup rescans.
     signature = _skill_dirs_signature()
     commands: dict[str, dict[str, Any]] = {}
+    # Fork patch: parallel collision map, published atomically with *commands* (same lock/sig).
+    collisions: dict[str, dict[str, Any]] = {}
     try:
         from tools.skills_tool import _get_disabled_skill_names, _skill_catalog
         disabled = _get_disabled_skill_names()
@@ -541,7 +563,7 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
         for entry in _skill_catalog():
             if entry["status"] == "unique":
                 try:
-                    _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands)
+                    _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands, collisions)
                 except Exception:
                     continue
     except Exception:
@@ -554,6 +576,7 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
         # reader between the lookup and this store (#14536, #74574); the scan above
         # (file I/O, deferred imports) stays outside it.
         _skill_commands_by_key[key] = commands
+        _collision_skill_commands_by_key[key] = collisions
         _skill_commands_sig_by_key[key] = signature
     return commands
 
@@ -629,6 +652,24 @@ def get_skill_commands() -> dict[str, dict[str, Any]]:
     # Scan outside the lock — file I/O and deferred imports; concurrent scans
     # are safe since each builds its own map.
     return scan_skill_commands()
+
+
+def get_collision_skill_commands() -> dict[str, dict[str, Any]]:
+    """Fork patch: return the ``{"/skill:<slug>": info}`` map of core-command-collision skills.
+
+    Published by the same ``scan_skill_commands()`` pass as ``get_skill_commands()`` and sharing
+    its rescan-on-signature-change logic, so the two maps never disagree about staleness. Empty
+    when ``safe_worker`` policy disables skill commands (same gate as ``get_skill_commands``).
+    """
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        return {}
+    # Force the same scan/cache cycle get_skill_commands() runs, then read the collision map.
+    get_skill_commands()
+    key = (_resolve_skill_commands_platform(), _resolve_skill_commands_home(), _resolve_skill_commands_project())
+    with _publish_lock:
+        return dict(_collision_skill_commands_by_key.get(key) or {})
 
 
 # Plugin projection cache. The projection re-parses every plugin SKILL.md and sits on the
@@ -798,8 +839,15 @@ def resolve_skill_command_key(command: str, *, interactive: bool = False) -> Opt
     Try the exact qualified spelling before the filesystem skill slug fallback,
     where underscores and hyphens are interchangeable for Telegram. Native
     callers retain the filesystem-only lookup; plugin skills are interactive.
+    Fork patch: falls back to the collision map, so a user-typed
+    ``/skill:<slug>`` (Discord ``/skill`` autocomplete dispatch) resolves even
+    though its ``/<slug>`` form is owned by a core command.
     """
-    return resolve_slash_key(command, get_interactive_skill_commands() if interactive else get_skill_commands())
+    table = get_interactive_skill_commands() if interactive else get_skill_commands()
+    key = resolve_slash_key(command, table)
+    if key is not None:
+        return key
+    return resolve_slash_key(command, get_collision_skill_commands())
 
 
 def resolve_slash_key(command: str, table: Mapping[str, Any]) -> Optional[str]:
@@ -817,7 +865,9 @@ def build_skill_invocation_message(
     cmd_key: str, user_instruction: str = "", task_id: str | None = None, runtime_note: str = "",
 ) -> Optional[str]:
     """Build the user message for a skill slash command, or None if not found."""
-    skill_info = get_interactive_skill_commands().get(cmd_key)
+    # Fork patch: collision-keyed skills (/skill:<slug>) live only in the collision map.
+    skill_info = (get_interactive_skill_commands().get(cmd_key)
+                  or get_collision_skill_commands().get(cmd_key))
     loaded = _load_skill_payload(skill_info.get("skill_identifier") or skill_info["skill_dir"], task_id=task_id) if skill_info else None
     if not loaded:
         return None

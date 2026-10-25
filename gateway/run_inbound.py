@@ -1076,7 +1076,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
         try:
             from agent.skill_commands import (
-                get_skill_commands, build_skill_invocation_message, resolve_skill_command_key
+                get_skill_commands, build_skill_invocation_message, resolve_skill_command_key,
+                get_collision_skill_commands,
             )
             skill_cmds = get_skill_commands()
             cmd_key = resolve_skill_command_key(command)
@@ -1095,7 +1096,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             except Exception:
                 _build_stacked = None
                 extra_keys, stacked_instruction = [], user_instruction
-            _skill_name = skill_cmds[cmd_key].get("name", "")
+            _skill_name = skill_cmds[cmd_key].get("name", "") if cmd_key in skill_cmds else (
+                # Fork patch: collision skills resolve under /skill:<slug>, which is absent
+                # from get_skill_commands(); read the name from the collision map so the
+                # per-platform disabled check below still applies to them.
+                get_collision_skill_commands().get(cmd_key, {}).get("name", ""))
             if _plat and (_skill_name or extra_keys):
                 # Per-platform disabled check: get_skill_commands() only applies the *global*
                 # disabled list at scan time (process-global cache across platforms), and
