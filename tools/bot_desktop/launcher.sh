@@ -264,12 +264,19 @@ Xvnc "$DISPLAY" -geometry "$GEOM" -depth "$DEPTH" -dpi 96 \
   -Log '*:stderr:30' 2> >(grep -v --line-buffered 'Could not resolve keysym' >&2) &
 XVNC_PID=$!
 trap 'kill "$XVNC_PID" 2>/dev/null || true' EXIT
+# The readiness probe MUST be bounded. The FIRST xdpyinfo against a just-started Xvnc does not fail
+# fast — the server accepts the connection but does not answer the setup request until it has
+# finished initializing, so an unbounded xdpyinfo blocks FOREVER instead of returning non-zero.
+# That wedged probe never returns, the loop below never advances, and the launcher never publishes
+# its env file: the screen looks like it failed to start when the X server is actually fine.
+# `timeout` turns the block into a failed probe, so the loop retries and succeeds once the server
+# is up. 5s is generous for a probe; the loop's own budget is 100 x (5s + 0.1s) ≈ 8.5 minutes.
 for _ in $(seq 1 100); do
-  xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+  timeout 5 xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
   kill -0 "$XVNC_PID" 2>/dev/null || { echo "Xvnc exited during startup" >&2; exit 1; }
   sleep 0.1
 done
-xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || { echo "Xvnc did not become ready" >&2; exit 1; }
+timeout 5 xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || { echo "Xvnc did not become ready" >&2; exit 1; }
 
 setxkbmap -display "$DISPLAY" us 2>/dev/null || true   # RFB keysyms + xdotool assume a known layout
 xsetroot -display "$DISPLAY" -solid '#1c1f29' 2>/dev/null || true
@@ -332,7 +339,7 @@ dbus-run-session -- bash -c '
     > "$HERMES_BD_ENV_FILE.tmp" && mv -f "$HERMES_BD_ENV_FILE.tmp" "$HERMES_BD_ENV_FILE"
   xfsettingsd --sm-client-disable --daemon 2>/dev/null || true
   xfwm4 --compositor=off --sm-client-disable &
-  for _ in $(seq 1 50); do xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break; sleep 0.1; done
+  for _ in $(seq 1 50); do timeout 5 xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break; sleep 0.1; done
   xfdesktop --sm-client-disable --disable-wm-check &
   exec xfce4-panel --sm-client-disable --disable-wm-check
 ' && rc=0 || rc=$?

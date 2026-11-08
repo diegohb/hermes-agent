@@ -34,12 +34,21 @@ def next_check_in(limit: float, idle: Optional[float]) -> int:
 
 
 def _own_launcher(argv: list[str]) -> Optional[tuple[int, float]]:
-    """``(pid, create_time)`` of the launcher that ran this check (its pid is the one argument), so the
+    """``(pid, start_ticks)`` of the launcher that ran this check (its pid is the one argument), so the
     check stops only that screen and never a replacement started while it waited on ``start.lock``. A
-    launcher already gone gets an identity nothing matches."""
+    launcher already gone gets an identity nothing matches.
+
+    The unit MUST match what ``runtime._launcher_identity()`` returns (kernel start ticks), or the
+    comparison in ``runtime._idle_due`` compares a tick count against an epoch and never matches —
+    which would leave an abandoned screen running forever. ``runtime._start_ticks`` is the same
+    clock-safe primitive the identity check uses.
+    """
     pid_s = argv[0] if argv else ""
     if not pid_s.isdigit():
         return None
+    ticks = runtime._start_ticks(int(pid_s))
+    if ticks is not None:
+        return int(pid_s), float(ticks)
     born = runtime._create_time(int(pid_s))
     return int(pid_s), born if born is not None else -1.0
 

@@ -180,20 +180,69 @@ def _create_time(pid: int) -> Optional[float]:
         return None
 
 
+def _start_ticks(pid: int) -> Optional[int]:
+    """Kernel start ticks of ``pid`` (field 22 of ``/proc/<pid>/stat``), or None.
+
+    Clock-safe process identity. ``psutil.Process(pid).create_time()`` is ``btime + starttime/CLK_TCK``,
+    so it MOVES whenever the kernel's ``btime`` moves — and on WSL2/VM hosts the host clock is
+    periodically corrected, which shifts ``btime`` and therefore every process's ``create_time`` by the
+    same amount. Start ticks are a raw monotonic counter since boot and never move, so they identify
+    the same way the rest of Hermes does (see ``hermes_cli/update_lock.py`` and
+    ``gateway/host_rendezvous.py``, which use ticks for exactly this reason).
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read()
+        return int(stat[stat.rindex(b")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _launcher_identity() -> Optional[tuple[int, float]]:
-    """``(pid, create_time)`` of the live launcher, or None. ``launcher.pid`` holds ``"<pid> <create_time>"``:
+    """``(pid, start_ticks)`` of the live launcher, or None. ``launcher.pid`` holds ``"<pid> <start_ticks>"``:
     a recycled pid with a different start time is somebody else's process and must never be reported as
-    ours nor killed by :func:`stop`. The pre-identity single-number format is treated as not running."""
+    ours nor killed by :func:`stop`. The pre-identity single-number format is treated as not running.
+
+    The start time is kernel start TICKS, not a wall-clock epoch. psutil's ``create_time()`` is
+    ``btime + starttime/CLK_TCK``, so it MOVES whenever the kernel's ``btime`` moves — and on WSL2/VM
+    hosts the host clock is periodically corrected, which shifts ``btime`` and therefore every process's
+    ``create_time`` by the same amount. A stored epoch then no longer matches a fresh read even though
+    the process never restarted, and the screen is reported as DOWN while its X server is up and serving
+    (the failure this fixes: the Bot Desktop looked stopped, so nothing published its DISPLAY and every
+    consumer fell back to the host's broken display).
+
+    The recorded file keeps its ``"<pid> <create_time>"`` shape, but the value stored is the kernel
+    start TICK count (an integer) instead of an epoch, so the comparison is exact and clock-independent.
+    Legacy files holding a float epoch are compared the old way, with the wall-clock tolerance.
+
+    The returned value is always the LIVE tick count of the process (never the recorded one), so every
+    caller that compares this identity against a freshly-read one — see
+    ``tools.bot_desktop.idle_watch._own_launcher`` — compares like with like.
+    """
     raw = _read(state_dir() / "launcher.pid")
     pid_s, _, born_s = (raw or "").partition(" ")
     if not pid_s.isdigit() or not born_s:
         return None
     try:
-        pid, born = int(pid_s), float(born_s)
+        pid = int(pid_s)
     except ValueError:
         return None
+    if not _pid_alive(pid):
+        return None
+    live_ticks = _start_ticks(pid)
+    try:
+        recorded = float(born_s)
+    except ValueError:
+        return None
+    if live_ticks is not None and recorded.is_integer() and abs(recorded - live_ticks) <= 1:
+        return (pid, float(live_ticks))
+    # Legacy epoch format, or no /proc: the original wall-clock comparison.
     actual = _create_time(pid)
-    return (pid, born) if actual is not None and abs(actual - born) < 0.01 and _pid_alive(pid) else None
+    if actual is None:
+        return None
+    if abs(actual - recorded) >= 0.01:
+        return None
+    return (pid, float(live_ticks) if live_ticks is not None else recorded)
 
 
 def _launcher_pid() -> Optional[int]:
@@ -471,13 +520,18 @@ def idle_stop_seconds() -> float:
 
 def _idle_due(launcher: Optional[tuple[int, float]]) -> Optional[float]:
     """Idle seconds when the screen is due for the idle stop now, else None. ``launcher`` (``(pid,
-    create_time)``) limits it to that one screen: a replacement started since is never due."""
+    start_ticks)``) limits it to that one screen: a replacement started since is never due.
+
+    Both sides of the identity comparison are kernel start ticks (an integer count since boot), so the
+    tolerance is one tick of slack rather than a wall-clock epsilon — the same "is this the same
+    process incarnation?" question, asked with a clock-independent unit.
+    """
     limit = idle_stop_seconds()
     if limit <= 0 or not is_running():
         return None
     if launcher is not None:
         current = _launcher_identity()
-        if current is None or current[0] != launcher[0] or abs(current[1] - launcher[1]) >= 0.01:
+        if current is None or current[0] != launcher[0] or abs(current[1] - launcher[1]) > 1:
             return None
     idle = idle_seconds()
     if idle is None or idle < limit:
@@ -827,7 +881,13 @@ def _spawn_and_wait(sd: Path, wait_seconds: float) -> DesktopStatus:
             ["bash", str(_LAUNCHER)], env=child_env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
             start_new_session=True, close_fds=True)  # detached-spawn: ok — per-profile screen, outlives its starter
         log.close()
-        born = _create_time(proc.pid)
+        # Record the kernel start TICKS, not a wall-clock epoch: psutil's create_time() moves with
+        # /proc/stat btime, which a WSL2/VM host's clock correction shifts for every process at once.
+        # A stored epoch then stops matching the live launcher and the screen is reported as down
+        # while it is up. Ticks are monotonic and exact (see _launcher_identity).
+        born = _start_ticks(proc.pid)
+        if born is None:  # no /proc: fall back to the wall-clock epoch the reader also understands
+            born = _create_time(proc.pid)
         (sd / "launcher.pid").write_text(f"{proc.pid} {born if born is not None else 0}", encoding="utf-8")
 
         deadline = time.monotonic() + wait_seconds
