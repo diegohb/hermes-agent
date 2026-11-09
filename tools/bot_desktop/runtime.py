@@ -457,14 +457,49 @@ def tool_placement() -> str:
     return placement.TERMINAL
 
 
+def _display_answers(display: str, env: Optional[dict[str, str]] = None, timeout: float = 5.0) -> bool:
+    """True when an X server on ``display`` answers a request within ``timeout``.
+
+    A DISPLAY that is merely SET is not a seat: WSLg's X server accepts the socket
+    connection and then never answers the setup request, so every client that waits on it
+    blocks forever. The probe is bounded for the same reason the launcher's readiness probe
+    is (``timeout 5 xdpyinfo`` in launcher.sh): an unbounded probe would hang the caller
+    instead of failing, which is the trap this exists to avoid.
+
+    ``env`` supplies the child's environment so an XAUTHORITY that applies to the seat
+    applies to the probe too.
+    """
+    child_env = dict(os.environ)
+    if env:
+        child_env.update(env)
+    try:
+        done = subprocess.run(["xdpyinfo", "-display", display], check=False, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=timeout, env=child_env)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
 def _should_auto_start(env: dict[str, str]) -> bool:
-    if not is_supported_host() or env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
+    """Whether this profile's screen should be brought up because the host has no usable seat.
+
+    A merely-SET ``DISPLAY`` is not a seat. The ambient display is PROBED (bounded), and one
+    that does not answer counts as no display — otherwise a dead seat suppresses the
+    auto-start that would have provided a working one, and every consumer of the screen
+    inherits the dead seat instead.
+    """
+    if not is_supported_host() or env.get("WAYLAND_DISPLAY"):
         return False
     if missing_binaries():
         return False
     from hermes_cli.config import load_config_readonly
     cfg = load_config_readonly().get("bot_desktop") or {}
-    return bool(cfg.get("auto_start", False))
+    if not cfg.get("auto_start", False):
+        return False
+    display = env.get("DISPLAY")
+    if display and _display_answers(display, env):
+        return False  # a real, answering seat: keep it
+    return True
 
 
 # ---- idle auto-stop -------------------------------------------------------------------------------

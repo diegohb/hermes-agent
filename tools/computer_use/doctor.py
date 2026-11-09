@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import platform as _platform_mod
+import queue
 import re
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager, suppress
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -121,12 +123,75 @@ def _open_mcp(binary: str) -> subprocess.Popen:
                             text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=windows_hide_flags(),
                             env=_sanitized_cua_env())
 
-def _mcp_rpc(proc: subprocess.Popen, msg_id: int, method: str, params: Any = None) -> Report:
-    """Write one JSON-RPC request and read one response line."""
+def _no_display_hint() -> str:
+    """Actionable remedy for a driver that never answered: name the seat that is missing.
+
+    The doctor speaks to cua-driver over stdio; cua-driver then talks to X11. A driver whose
+    X11 init never completes answers no RPC at all, so the only useful thing the doctor can
+    say is WHICH SEAT is missing — an absent Bot Desktop screen and a published-but-dead X
+    server are different problems with different fixes.
+    """
+    try:
+        from tools.bot_desktop.runtime import published_env
+        published = (published_env() or {}).get("DISPLAY")
+    except Exception:  # a missing bot_desktop module must not mask the real failure
+        published = None
+    if published:
+        return (f"the Bot Desktop screen is published on DISPLAY={published} but its X server never answered — "
+                f"the driver's X11 init is blocked; restart the screen: hermes computer-use screen stop && "
+                f"hermes computer-use screen start")
+    ambient = os.environ.get("DISPLAY")
+    if ambient:
+        return (f"the Bot Desktop screen is not running (published DISPLAY is absent) and the ambient "
+                f"DISPLAY={ambient} did not answer either — start the screen: hermes computer-use screen start")
+    return ("the Bot Desktop screen is not running (published DISPLAY is absent) — "
+            "start the screen: hermes computer-use screen start")
+
+
+def _readline_with_timeout(proc: subprocess.Popen, timeout: float) -> str:
+    """``proc.stdout.readline()`` bounded by *timeout* seconds.
+
+    A live-but-wedged child (cua-driver blocked in its X11 init) never EOFs and never
+    answers, so an unbounded ``readline()`` blocks forever: the caller waits on a child that
+    will never speak and the CLI produces NO output at all. The read itself still goes through
+    ``proc.stdout.readline()`` — the mocked seam the tests drive — but it runs on a worker
+    thread, so the wait is bounded even when the child is wedged.
+
+    The worker is a daemon thread: on timeout the child is killed and the thread's blocked
+    ``readline()`` ends with the pipe closing.
+    """
+    box: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            box.put(("line", proc.stdout.readline()))
+        except BaseException as exc:
+            box.put(("error", exc))
+
+    worker = threading.Thread(target=_reader, daemon=True)
+    worker.start()
+    try:
+        kind, value = box.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError(f"cua-driver did not answer within {timeout:g}s")
+    if kind == "error":
+        raise value
+    return str(value)
+
+
+def _mcp_rpc(proc: subprocess.Popen, msg_id: int, method: str, params: Any = None, timeout: float = 12.0) -> Report:
+    """Write one JSON-RPC request and read one response line (bounded by *timeout*)."""
     payload: Report = {"jsonrpc": "2.0", "id": msg_id, "method": method, **({"params": params} if params is not None else {})}
     proc.stdin.write(json.dumps(payload) + "\n")
     proc.stdin.flush()
-    line = proc.stdout.readline()
+    try:
+        line = _readline_with_timeout(proc, timeout)
+    except TimeoutError as e:
+        # The child is wedged (it will never answer this or any later RPC): kill it now so the
+        # session teardown's proc.wait() returns at once instead of burning the timeout again.
+        with suppress(Exception):
+            proc.kill()
+        raise RuntimeError(f"cua-driver did not answer {method!r} within {timeout:g}s — {_no_display_hint()}") from e
     if not line:
         tail: list[str] = []
         with suppress(Exception):  # last 3 stderr lines, best-effort
@@ -140,9 +205,9 @@ def _mcp_rpc(proc: subprocess.Popen, msg_id: int, method: str, params: Any = Non
         raise RuntimeError(f"{method} JSON-RPC error: {resp['error']}")
     return resp
 
-def _call_tool(proc: subprocess.Popen, msg_id: int, name: str, arguments: Any = None) -> Any:
+def _call_tool(proc: subprocess.Popen, msg_id: int, name: str, arguments: Any = None, timeout: float = 12.0) -> Any:
     """tools/call *name* → raw ``result`` value (``{}`` when absent)."""
-    return _mcp_rpc(proc, msg_id, "tools/call", {"name": name, "arguments": arguments or {}}).get("result") or {}
+    return _mcp_rpc(proc, msg_id, "tools/call", {"name": name, "arguments": arguments or {}}, timeout=timeout).get("result") or {}
 
 @contextmanager
 def _mcp_session(binary: str, timeout: float) -> Iterator[subprocess.Popen]:
@@ -163,8 +228,8 @@ def _drive_health_report(binary: str, *, include: Sequence[str] = (), skip: Sequ
     """Handshake + `health_report` → report; HealthReportUnavailable (caller falls back) or RuntimeError."""
     args = {k: list(v) for k, v in (("include", include), ("skip", skip)) if v}
     with _mcp_session(binary, timeout) as proc:
-        _mcp_rpc(proc, 1, "initialize", {})
-        result = _call_tool(proc, 2, "health_report", args)
+        _mcp_rpc(proc, 1, "initialize", {}, timeout=timeout)
+        result = _call_tool(proc, 2, "health_report", args, timeout=timeout)
     if not isinstance(result, dict):
         raise RuntimeError(f"health_report result was not an object: {type(result).__name__}")
     return _extract_health_report_from_result(result)
@@ -172,10 +237,10 @@ def _drive_health_report(binary: str, *, include: Sequence[str] = (), skip: Sequ
 def _structured(result: Report) -> Report:
     return result["structuredContent"] if isinstance(result.get("structuredContent"), dict) else {}
 
-def _probe_tool(proc: subprocess.Popen, msg_id: int, name: str) -> tuple[Optional[Report], Optional[str]]:
+def _probe_tool(proc: subprocess.Popen, msg_id: int, name: str, timeout: float = 12.0) -> tuple[Optional[Report], Optional[str]]:
     """``(result, None)`` on success; ``(None, error_text)`` on isError or RPC failure."""
     try:
-        result = _call_tool(proc, msg_id, name)
+        result = _call_tool(proc, msg_id, name, timeout=timeout)
     except RuntimeError as e:
         return None, str(e)
     return (None, _first_text(result, f"{name} isError")) if result.get("isError") is True else (result, None)
@@ -184,12 +249,12 @@ def _drive_fallback_probes(binary: str, *, timeout: float = 12.0) -> Report:
     """One MCP session: initialize serverInfo version + check_permissions + list_apps probe results."""
     out: Report = dict.fromkeys(("init_version", "permissions", "permissions_error", "list_apps_ok", "list_apps_error", "list_apps_count"))
     with _mcp_session(binary, timeout) as proc:
-        server_info = (_mcp_rpc(proc, 1, "initialize", {}).get("result") or {}).get("serverInfo") or {}
+        server_info = (_mcp_rpc(proc, 1, "initialize", {}, timeout=timeout).get("result") or {}).get("serverInfo") or {}
         out["init_version"] = server_info.get("version") if isinstance(server_info, dict) else None
-        perms, out["permissions_error"] = _probe_tool(proc, 2, "check_permissions")  # primary TCC signal on 0.10
+        perms, out["permissions_error"] = _probe_tool(proc, 2, "check_permissions", timeout=timeout)  # primary TCC signal on 0.10
         out["permissions"] = _structured(perms) if perms is not None else None
         # list_apps — light AX capability probe; text-only success still counts as AX working
-        apps, out["list_apps_error"] = _probe_tool(proc, 3, "list_apps")
+        apps, out["list_apps_error"] = _probe_tool(proc, 3, "list_apps", timeout=timeout)
         out["list_apps_ok"] = apps is not None
         app_list = _structured(apps).get("apps") if apps is not None else None
         out["list_apps_count"] = len(app_list) if isinstance(app_list, list) else None
